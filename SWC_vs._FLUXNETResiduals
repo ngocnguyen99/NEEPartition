@@ -1,0 +1,30 @@
+#Finding what factors cause the discrepancy between FLUXNET model and observation
+#Output: 2 graphs: 1st graph: SWC vs Residuals; 2nd graph: SWC vs. Observed Respiration; 3rd: SWC vs. Predicted Respiration
+#Create a shortcut function applied to a foler with multiple files
+SWC_residual_relationship <- function(folder_directory) {
+  list_file <- list.files(folder_directory)
+  for(i in 1:length(list_file)) {
+    site_name = list_file[i]
+    site_dir = paste(folder_directory, site_name, sep = "")
+    site_data <- read.csv(site_dir, header = TRUE)
+    site_data$Time_full <-  BerkeleyJulianDateToPOSIXct(site_data$TIMESTAMP_END)
+    site_data$Time <- format(site_data$Time_full, format = "%Y-%m-%d")
+    site_data_night <- subset(site_data, NEE_VUT_REF > 0 & NEE_VUT_REF_QC == 0 & NIGHT == 1)  
+    site_data_night$residual <- site_data_night$NEE_VUT_REF - site_data_night$RECO_NT_VUT_REF
+    residual_dataset <- data.frame(site_data_night$Time_full, site_data_night$Time, site_data_night$residual, site_data_night$NEE_VUT_REF,
+                                   site_data_night$RECO_NT_VUT_REF, site_data_night$SWC_F_MDS_1, site_data_night$SWC_F_MDS_1_QC)
+    colnames(residual_dataset) <- c("Time_full", "Time", "Residual", "Nighttime_NEE", "Predicted_RECO", "SWC", "SWC_QC")
+    residual_dataset_SWC_sel <- subset(residual_dataset, SWC_QC == 0)
+    par(mfrow = c(1, 2))
+    #Plot residual and SWC on x and y axis
+    plot(residual_dataset_SWC_sel$SWC, residual_dataset_SWC_sel$Residual, pch = 20, col = "gray", 
+         ylab = "Residuals - umolC m-2 s-1", xlab = "SWC - %", main = site_name)
+    abline(h = 0, col = "blue")
+    #Plot SWC vs. Observed Respiration
+    plot(residual_dataset_SWC_sel$SWC, residual_dataset_SWC_sel$Nighttime_NEE, pch = 20, 
+         main = site_name, ylab = "Observed RECO", xlab = "SWC")
+    #Plot SWC vs. Predicted Respiration
+    plot(residual_dataset_SWC_sel$SWC, residual_dataset_SWC_sel$Predicted_RECO, pch = 20, 
+         main = site_name, ylab = "Predicted RECO", xlab = "SWC")
+  }
+}
