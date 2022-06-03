@@ -1,0 +1,319 @@
+---
+title: "US-UMB-Regression"
+author: "Ngoc Nguyen"
+date: '2022-04-29'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(REddyProc)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(purrr)
+library(runner)
+library(minpack.lm)
+require(lubridate)
+library(zoo)
+library(gridExtra)
+library(astsa, quietly=TRUE, warn.conflicts=FALSE)
+library(knitr)
+library(plyr)
+library(TTR)
+library(tidyverse)
+library(timetk)
+library(tidyquant)
+library(yardstick)
+library(xts)
+```
+
+```{r}
+data_fluxnet <- read.table("/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/FLUXNET/UMB_fluxnet_formatted.txt", header = TRUE)
+data_notformated_fluxnet <- read.csv("/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/FLUXNET/FLX_US-UMB_FLUXNET2015_SUBSET_HH_2007-2017_beta-4.csv", header = TRUE)
+```
+
+```{r}
+##Estimate RECO using both temperature and precipitation 
+##RECO night = R0*f(P)*f(T)
+#Filter night-time RECO
+#Criteria to choose golden days for regression 
+data_fluxnet$Time_full <-  BerkeleyJulianDateToPOSIXct(data_notformated_fluxnet$TIMESTAMP_END)
+data_fluxnet$Time <- format(data_fluxnet$Time, format = "%Y-%m-%d")
+ustar_night_filter <- subset(data_fluxnet, NEE_VUT_REF > 0 & NEE_VUT_REF_QC == 0 & 
+                               NIGHT == 1 & SWC_F_MDS_1_QC == 0 & TS_F_MDS_1_QC == 0)  
+shortcut_regression <- data.frame(ustar_night_filter$Time_full, ustar_night_filter$Time, ustar_night_filter$Year, ustar_night_filter$DOY, ustar_night_filter$Hour, ustar_night_filter$SWC_F_MDS_1, ustar_night_filter$NEE_VUT_REF, ustar_night_filter$TS_F_MDS_1)
+colnames(shortcut_regression) <- c("Time_full", "Time", "Year", "DOY", "Hour", "SWC", "NEE", "TS")
+shortcut_regression
+```
+##Estimate constant K at the site *SWC*(1+K)*0.01/(k + SWC*0.01)
+
+```{r}
+##Estimate constant K at the site *SWC*(1+K)*0.01/(k + SWC*0.01)
+test_eachWindow = subset(shortcut_regression)
+#Create an empty list to store K, RSE of K
+K_collection <- c()
+K_RSE <- c()
+#Create a regression date list
+date_list <- seq(as.Date(unique(shortcut_regression$Time)[1]),
+                 as.Date(unique(shortcut_regression$Time)[length(unique(shortcut_regression$Time))]), 
+                 by = 5)
+##Loop starts and preparation
+for( i in as.list(date_list)) {
+    test_loop = subset(test_eachWindow, as.Date(Time) >= i & as.Date(Time) <= i + days(14))
+    if(nrow(test_loop) >= 6) { #Only choose window with >= 6 points and temp range >= 5C
+      temp_range = max(test_loop$TS) - min(test_loop$TS)
+      if(temp_range >= 5) {
+        regression_nls <- nls(NEE ~ R0*exp(E0 * (1/(288.15 - 227.13) - 1/(TS + 273.15 - 227.13)))*SWC*(1+K)*0.01/(K + SWC*0.01), 
+                              data = test_loop, control = nls.control(warnOnly = TRUE), start = list(R0 = 1, E0 = 100, K = 0.01))
+        K_collection <- append(K_collection, coef(regression_nls)[3])
+        K_RSE <- append(K_RSE, summary(regression_nls)$parameters["K",2])
+      }
+    } 
+}
+
+K_collection <- as.data.frame(K_collection)
+K_RSE <- as.data.frame(K_RSE)
+K_data <- data.frame(K_collection, K_RSE)
+K_data <- subset(K_data, K_collection > 0)
+min1_index <- which(K_data$K_RSE == min(K_data$K_RSE))
+min2_index <- which(K_data$K_RSE == min(K_data$K_RSE[-min1_index]))
+min3_index <- which(K_data$K_RSE == min(K_data$K_RSE[-c(min1_index, min2_index)]))
+K_mean <- mean(K_data$K_collection[c(min1_index, min2_index, min3_index)])
+K_mean_RSE <- mean(K_data$K_RSE[c(min1_index, min2_index, min3_index)])
+K_mean
+#16% of windows passed
+```
+
+##Estimate short and long-term E0 
+```{r}
+##Estimate short-term E0 with the value K estimated above
+##Loop starts and preparation
+E0_collection <- c()
+E0_RSE <- c()
+E0_date <- c()
+for( i in as.list(date_list)) {
+    test_loop = subset(shortcut_regression, as.Date(Time) >= i & as.Date(Time) <= i + days(14))
+    if(nrow(test_loop) >= 6) { #Only choose window with >= 6 points and temp range >= 5C
+      temp_range = max(test_loop$TS) - min(test_loop$TS)
+      if(temp_range >= 5) {
+        regression_nls <- nls(NEE ~ R0*exp(E0 * (1/(288.15 - 227.13) - 1/(TS + 273.15 - 227.13)))*SWC*(1+K_mean)*0.01/(K_mean + SWC*0.01),
+                              data = test_loop, control = nls.control(warnOnly = TRUE), start = list(R0 = 1, E0 = 100))
+        E0_collection <- append(E0_collection, coef(regression_nls)[2])
+        E0_RSE <- append(E0_RSE, summary(regression_nls)$parameters["E0",2])
+        E0_date <- append(E0_date, i + days(14))
+      } 
+    } 
+}
+E0_collection <- as.data.frame(E0_collection)
+E0_RSE <- as.data.frame(E0_RSE)
+E0_date <- as.data.frame(E0_date)
+E0_data_notFiltered <- data.frame(E0_collection, E0_RSE, E0_date)
+E0_data_notFilteredRSE <- subset(E0_data_notFiltered, E0_collection > 0 & E0_collection < 450)
+E0_data <- subset(E0_data_notFiltered, E0_collection > 0 & E0_collection < 450 & E0_RSE < 0.5*E0_collection) #only E0 values within the range of 0-450K and having RSE less than 50% are chosen
+min1_index_E0 <- which(E0_data$E0_RSE == min(E0_data$E0_RSE))
+min2_index_E0 <- which(E0_data$E0_RSE == min(E0_data$E0_RSE[-min1_index_E0]))
+min3_index_E0 <- which(E0_data$E0_RSE == min(E0_data$E0_RSE[-c(min1_index_E0, min2_index_E0)]))
+E0_short_term <- mean(E0_data$E0_collection[c(min1_index_E0, min2_index_E0, min3_index_E0)])
+
+##Long-term E0 estimation
+regression_nls_long_term <- nls(NEE ~ R0*exp(E0 * (1/(288.15 - 227.13) - 1/(TS + 273.15 - 227.13)))*SWC*(1+K_mean)*0.01/(K_mean + SWC*0.01),
+                          data = shortcut_regression, control = nls.control(warnOnly = TRUE), start = list(R0 = 1, E0 = 1))
+E0_long_term <- coef(regression_nls_long_term)[2]
+E0_RSE_long_term <- summary(regression_nls_long_term)$parameters["E0",2]
+# Plot short-term E0
+plot(E0_data$E0_date, E0_data$E0_collection, type = "b", pch = 20, col = "dark blue", xlab = "Date", ylab = "Temperature Sensitivity (E0)")
+E0_long_term
+```
+
+##Estimate R0
+```{r}
+#Try do regression over R0 (4 days) one more time
+R0_collection <- c()
+R0_RSE <- c()
+date <- c()
+shortcut_regression
+for( i in as.list(date_list)) {
+    test_loop = subset(shortcut_regression, as.Date(Time) >= i & as.Date(Time) <= (i + days(3)))
+    if(nrow(test_loop) >= 3) { #Only choose window with >= 6 points and temp range >= 5C
+        regression_nls <- nls(NEE ~ R0*exp(E0_short_term * (1/(288.15 - 227.13) - 1/(TS + 273.15 - 227.13)))*SWC*(1+K_mean)*0.01/(K_mean + SWC*0.01), data = test_loop, control = nls.control(warnOnly = TRUE), start = list(R0 = 1))
+        R0_collection <- append(R0_collection, coef(regression_nls)[1])
+        R0_RSE <- append(R0_RSE, summary(regression_nls)$parameters["R0",2])
+        time <- test_loop[nrow(test_loop), "Time_full"]
+        date <- append(date, time)
+    }
+}
+
+R0_data <- data.frame(as.data.frame(date), as.data.frame(R0_collection))
+colnames(R0_data) <- c("Time_full", "R0_original")
+df_full <- data.frame(data_fluxnet$Time_full, data_fluxnet$Time, data_fluxnet$NEE_VUT_REF, data_fluxnet$NEE_VUT_REF_QC, data_fluxnet$SWC_F_MDS_1, data_fluxnet$SWC_F_MDS_1_QC, data_fluxnet$TS_F_MDS_1, data_fluxnet$TS_F_MDS_1_QC)
+colnames(df_full) <- c("Time_full", "Time" , "NEE", "NEE_QC", "SWC", "SWC_QC", "TS", "TS_QC")
+R0_merged <- merge(R0_data, df_full, all = TRUE, by = "Time_full")
+# Deleting initial and ending NA value of R0
+index <- which(!is.na(R0_merged$R0_original))
+R0_merged_filter_NA <- R0_merged[index[1]:index[length(index)], ]
+
+#Linear Interpolation for NA R0
+R0_interpolated <- data.frame(na.approx(R0_merged_filter_NA$R0))
+R0_merged_filter_NA <- data.frame(R0_merged_filter_NA, R0_interpolated)
+colnames(R0_merged_filter_NA) <- c("Time_full", "R0_original", "Time" , "NEE", "NEE_QC", "SWC", "SWC_QC", "TS", "TS_QC", "R0_interpolated")
+R0_merged_filter_NA$Res <- R0_merged_filter_NA$R0_interpolated*exp(E0_short_term*(1/(288.15 - 227.13) - 1/(R0_merged_filter_NA$TS + 273.15 - 227.13)))*R0_merged_filter_NA$SWC*(1+K_mean)*0.01/(K_mean + R0_merged_filter_NA$SWC*0.01)
+R0_merged_filter_NA$Year <- format(R0_merged_filter_NA$Time_full, format = "%Y")
+print(as.numeric(unique(R0_merged_filter_NA$Year)))
+```
+
+```{r}
+#Compare Ecosystem Respiration Data between FLUXNET and self-model and observations
+pdf(file = "/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/R0-Res-CompareSWC/Res_Comparison_UMB_NIGHT_SWC_FLUXNET")
+for(i in 2007:2017) {
+R0_merged_filter_NA_i <- subset(R0_merged_filter_NA, Year == as.character(i))
+data_fluxnet_i <- subset(data_fluxnet[index[1]:index[length(index)], ], Year == as.character(i))
+R0_merged_filter_NA_i$Res_NIGHT = data_fluxnet_i$NEE_VUT_REF
+R0_merged_filter_NA_i$Res_FLUXNET = data_fluxnet_i$RECO_NT_VUT_REF
+R0_merged_filter_NA_i$NIGHT = data_fluxnet_i$NIGHT
+R0_merged_filter_NA_i_QC <- subset(R0_merged_filter_NA_i, NEE_QC < 2 & SWC_QC < 2 & TS_QC < 2 & NIGHT == 1)
+
+#Plot
+print(ggplot(data = R0_merged_filter_NA_i_QC, aes(x = Time_full)) +
+  geom_point(aes(y = Res), color = "red", size = 0.4) + 
+  geom_point(aes(y = Res_FLUXNET), color = "black", size = 0.4) + 
+  geom_point(aes(y = Res_NIGHT), color = "blue", size = 0.4) + 
+  xlab("Date") + 
+  ylab("Reco") +
+  theme_bw())
+
+}
+dev.off()
+```
+
+```{r}
+#Compare Ecosystem Respiration Data between FLUXNET and self-model (full day-interpolated data)
+pdf(file = "/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/R0-Res-CompareSWC/Res_Comparison_UMB_SWC_FLUXNET")
+for(i in 2007:2017) {
+R0_merged_filter_NA_i <- subset(R0_merged_filter_NA, Year == as.character(i))
+data_fluxnet_i <- subset(data_fluxnet[index[1]:index[length(index)], ], Year == as.character(i))
+R0_merged_filter_NA_i$Res_FLUXNET = data_fluxnet_i$RECO_NT_VUT_REF
+R0_merged_filter_NA_i_QC <- subset(R0_merged_filter_NA_i, NEE_QC < 2 & SWC_QC < 2 & TS_QC < 2)
+
+#Plot
+print(ggplot(data = R0_merged_filter_NA_i_QC, aes(x = Time_full)) +
+  geom_line(aes(y = Res), color = 'red', size = 0.4) + 
+  geom_line(aes(y = Res_FLUXNET), color = 'black', size = 0.4) + 
+  xlab("Date") + 
+  ylab("Reco") +
+  theme_bw())
+}
+dev.off()
+```
+
+```{r}
+#Compare Reference Respiration Data between AllYearREddyProc and self-model 
+REddy_partition <- read.table("/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/UMB_REddyProc_Partition/UMB-base-self-partitionALLYEAR.txt", header = TRUE)[-1,]
+REddy_partition$Year <- data_fluxnet[-nrow(data_fluxnet), "Year"]
+pdf(file = "/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/R0-Res-CompareSWC/R0_Comparison_UMB_SWC_REddyProc")
+for(i in 2007:2017) {
+R0_merged_filter_NA_i <- subset(R0_merged_filter_NA, Year == as.character(i))
+REddy_partition_i <- subset(REddy_partition[index[1]:index[length(index)], ], Year == as.character(i))
+R0_merged_filter_NA_i$R0_REddyProc = as.numeric(REddy_partition_i$R_ref_uStar)
+R0_merged_filter_NA_i$Res_REddyProc = as.numeric(REddy_partition_i$Reco_uStar)
+R0_merged_filter_NA_i_QC <- subset(R0_merged_filter_NA_i, NEE_QC < 2 & SWC_QC < 2 & TS_QC < 2)
+#Plot
+print(ggplot(data = R0_merged_filter_NA_i_QC, aes(x = Time_full)) +
+  geom_line(aes(y = R0_interpolated), color = 'red', size = 0.4) + 
+  geom_line(aes(y = R0_REddyProc), color = 'black', size = 0.4) + 
+  xlab("Date") + 
+  ylab("R0") +
+  theme_bw())
+}
+dev.off()
+```
+
+```{r}
+REddy_partition <- read.table("/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/UMB_REddyProc_Partition/UMB-base-self-partitionALLYEAR.txt", header = TRUE)[-1,]
+REddy_partition$Year <- data_fluxnet[-nrow(data_fluxnet), "Year"]
+pdf(file = "/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/R0-Res-CompareSWC/Res_Comparison_UMB_SWC_REddyProc_FLUXNET")
+for(i in 2007:2017) {
+R0_merged_filter_NA_i <- subset(R0_merged_filter_NA, Year == as.character(i))
+REddy_partition_i <- subset(REddy_partition[index[1]:index[length(index)], ], Year == as.character(i))
+data_fluxnet_i <- subset(data_fluxnet[index[1]:index[length(index)], ], Year == as.character(i))
+R0_merged_filter_NA_i$Res_FLUXNET = data_fluxnet_i$RECO_NT_VUT_REF
+R0_merged_filter_NA_i$R0_REddyProc = as.numeric(REddy_partition_i$R_ref_uStar)
+R0_merged_filter_NA_i$Res_REddyProc = as.numeric(REddy_partition_i$Reco_uStar)
+R0_merged_filter_NA_i_QC <- subset(R0_merged_filter_NA_i, NEE_QC < 2 & SWC_QC < 2 & TS_QC < 2)
+#Plot
+print(ggplot(data = R0_merged_filter_NA_i_QC, aes(x = Time_full)) +
+  geom_line(mapping = aes(y = Res), color = 'red', size = 0.4) + 
+  geom_line(mapping = aes(y = Res_REddyProc), color = 'black', size = 0.4) + 
+  geom_line(mapping = aes(y = Res_FLUXNET), color = 'green', size = 0.4) +  
+  xlab("Date") + 
+  ylab("Reco") +
+  theme_bw())
+}
+dev.off()
+```
+```{r}
+#Compare Ecosystem Respiration Data between FLUXNET and self-model and observations (Calculating R squared)
+pdf(file = "/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/R0-Res-CompareSWC/Res_R_squared_UMB_NIGHT_SWC_FLUXNET", width = 14, height = 7)
+for(i in 2007:2017) {
+R0_merged_filter_NA_i <- subset(R0_merged_filter_NA, Year == as.character(i))
+data_fluxnet_i <- subset(data_fluxnet[index[1]:index[length(index)], ], Year == as.character(i))
+R0_merged_filter_NA_i$Res_NIGHT = data_fluxnet_i$NEE_VUT_REF
+R0_merged_filter_NA_i$Res_FLUXNET = data_fluxnet_i$RECO_NT_VUT_REF
+R0_merged_filter_NA_i$NIGHT = data_fluxnet_i$NIGHT
+R0_merged_filter_NA_i_QC <- subset(R0_merged_filter_NA_i, NEE_QC < 2 & SWC_QC < 2 & TS_QC < 2 & NIGHT == 1)
+rsquared_SWC <- rsq(R0_merged_filter_NA_i_QC, Res_NIGHT, Res)
+rsquared_FLUXNET <- rsq(R0_merged_filter_NA_i_QC, Res_NIGHT, Res_FLUXNET)
+
+# Plot R-squared graph linear
+par(mfrow = c(1, 2))
+plot(R0_merged_filter_NA_i_QC$Res, R0_merged_filter_NA_i_QC$Res_NIGHT, xlab = "SWC Modelled", ylab = "Observation", pch = 20, col = "red")
+text(5, 12, rsquared_SWC[,3], cex = .8, col = "red")
+
+plot(R0_merged_filter_NA_i_QC$Res_FLUXNET, R0_merged_filter_NA_i_QC$Res_NIGHT, xlab = "FLUXNET Modelled", ylab = "Observation", pch = 20, col = "black")
+text(5, 12, rsquared_FLUXNET[,3], cex = .8, col = "black")
+
+}
+dev.off()
+```
+
+
+
+
+```{r}
+# Decomposing modeled and observational time-series
+
+#Compare Ecosystem Respiration Data between FLUXNET and self-model and observations (Calculating R squared)
+pdf(file = "/Volumes/GoogleDrive/My Drive/Respiration-Project-Data/US-UMB-DBF/R0-Res-CompareSWC/Res_trend_UMB_NIGHT_SWC_FLUXNET", width = 7, height = 7)
+
+# Preparing data frame for time series
+R0_merged_filter_NA_i <- subset(R0_merged_filter_NA)
+data_fluxnet_i <- subset(data_fluxnet[index[1]:index[length(index)], ])
+R0_merged_filter_NA_i$Res_NIGHT = data_fluxnet_i$NEE_VUT_REF
+R0_merged_filter_NA_i$Res_FLUXNET = data_fluxnet_i$RECO_NT_VUT_REF
+R0_merged_filter_NA_i_QC <- subset(R0_merged_filter_NA_i, NEE_QC < 2 & SWC_QC < 2 & TS_QC < 2)
+
+
+# Decomposing Time series
+firstHour <- 48*(as.Date("2007-01-04 23:30:00")-as.Date("2007-01-01 00:00:00"))
+observation_ts <- ts(R0_merged_filter_NA_i_QC$Res_NIGHT, start = c(2007, firstHour),frequency = 48*365)
+SWC_ts <- ts(R0_merged_filter_NA_i_QC$Res, start = c(2007, firstHour), frequency = 48*365)
+FLUXNET_ts <- ts(R0_merged_filter_NA_i_QC$Res_FLUXNET, start = c(2007, firstHour), frequency = 48*365)
+SWC_ts_dec <- decompose(SWC_ts)
+FLUXNET_ts_dec <- decompose(FLUXNET_ts)
+
+#Plot
+plot(SWC_ts_dec, ylab = "SWC-modelled", col = "red")
+plot(FLUXNET_ts_dec, ylab = "FLUXNET", col = "black")
+plot
+dev.off()
+R0_merged_filter_NA_i_QC
+```
+
+
+
+
+
+
+
+
+
