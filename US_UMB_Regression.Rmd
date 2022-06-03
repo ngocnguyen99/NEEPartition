@@ -1,8 +1,7 @@
 ---
-title: "US-UMB-Regression"
+title: "NEE Partitioning - Soil Moisture Included"
 author: "Ngoc Nguyen"
-date: '2022-04-29'
-output: html_document
+date: '2022-06-02'
 ---
 
 ```{r setup, include=FALSE}
@@ -34,8 +33,6 @@ data_notformated_fluxnet <- read.csv("/Volumes/GoogleDrive/My Drive/Respiration-
 ```
 
 ```{r}
-##Estimate RECO using both temperature and precipitation 
-##RECO night = R0*f(P)*f(T)
 #Filter night-time RECO
 #Criteria to choose golden days for regression 
 data_fluxnet$Time_full <-  BerkeleyJulianDateToPOSIXct(data_notformated_fluxnet$TIMESTAMP_END)
