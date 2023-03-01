@@ -1,0 +1,907 @@
+---
+title: "Spec_Cluster_Moving_Window"
+author: "Ngoc Nguyen"
+date: "2023-01-20"
+output: html_document
+---
+
+##Setup functions and libraries
+```{r setup, include=FALSE}
+library(REddyProc)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(purrr)
+library(runner)
+library(minpack.lm)
+require(lubridate)
+library(zoo)
+library(gridExtra)
+library(astsa, quietly=TRUE, warn.conflicts=FALSE)
+library(knitr)
+library(plyr)
+library(TTR)
+library(tidyverse)
+library(timetk)
+library(tidyquant)
+library(yardstick)
+library(xts)
+library(hexbin)
+library(RColorBrewer)
+library(gridExtra)
+library(ggrepel)
+##Spectral Cluster and K-mean 
+library("kernlab")
+library(scales)
+library(plotly)
+library(ggfortify)
+library(cluster)
+#Single Spectrum Analysis
+library(Rssa)
+library(lattice)
+library(latticeExtra)
+library(fma)
+##ARIMA abnomaly detection
+library(forecast)
+library(stats)
+library(TimeSeries.OBeu)
+
+##Develop function to format the time column
+#Requirements: Add 6 columns of Time_full (YYYY-MM-DD-HH-MM-SS), Time (YYYY-MM-DD), DOY, Hour, Month, Year. All are in form of POSIXct or numeric
+time_convert <- function(df) {
+  df$Time_full <-  BerkeleyJulianDateToPOSIXct(df$TIMESTAMP_END)
+  df$Time <- as.Date(format(df$Time_full, "%Y-%m-%d"))
+  df$DOY <- as.numeric(format(df$Time_full, "%j"))
+  df$Hour <- as.numeric(format(df$Time_full, "%H")) + as.numeric(format(df$Time_full, "%M"))/60 
+  df$Month <- as.numeric(format(df$Time_full, "%m"))
+  df$Year <- as.numeric(format(df$Time_full,"%Y"))
+  return(df)
+}
+
+##Develop function to calculate daily EF. Using variable name "LE_F_MDS" and H_F_MDS. Filter for original, positive, and dat-time LE and H. Calculate mean EF during day-time and copy it to all hour during the day
+add_dailyEF <- function(df) {
+  if(length(which(df$LE_F_MDS_QC == 0)) > 100 | length(which(df$H_F_MDS_QC == 0)) > 100) {
+    df_sub <- subset(df, LE_F_MDS_QC == 0 & H_F_MDS_QC == 0 & NIGHT != 1 & H_F_MDS > 0 & LE_F_MDS > 0)
+    df_sub$EF <- df_sub$LE_F_MDS/(df_sub$LE_F_MDS + df_sub$H_F_MDS)
+    df_EF <- aggregate(EF ~ Time, data = df_sub, mean)
+    colnames(df_EF) <- c("Time", "Daily_EF")
+    df <- merge(df, df_EF, all = TRUE, by = "Time")
+    return(df)
+  }
+  else {
+    df_sub <- subset(df, NIGHT != 1 & H_F_MDS > 0 & LE_F_MDS > 0)
+    df_sub$EF <- df_sub$LE_F_MDS/(df_sub$LE_F_MDS + df_sub$H_F_MDS)
+    df_EF <- aggregate(EF ~ Time, data = df_sub, mean)
+    colnames(df_EF) <- c("Time", "Daily_EF")
+    df <- merge(df, df_EF, all = TRUE, by = "Time")
+    return(df)
+  }
+}
+ 
+##Obtaining training dataset
+##Filter for Night-time data only
+##Filter NT data that matches the QC for important variables
+##Filter 5% and 95% of Night-time data
+train_data_filter <- function(df) {
+  df_sub <- subset(df, !is.na(Daily_EF) & TS_F_MDS_1_QC == 0 & NEE_VUT_REF_QC == 0 & NIGHT == 1 & RECO_NT_VUT_REF > -9999)
+  # upper_NEE <- quantile(df_sub$NEE_VUT_REF - mean(df_sub$NEE_VUT_REF), 0.95)
+  # lower_NEE <- quantile(df_sub$NEE_VUT_REF - mean(df_sub$NEE_VUT_REF), 0.05)
+  # df_sub_bound <- subset(df_sub, (NEE_VUT_REF - mean(df_sub$NEE_VUT_REF) < upper_NEE))
+  # pct_NEE <- quantile(abs(df_sub$NEE_VUT_REF - mean(df_sub$NEE_VUT_REF)), 0.95)
+  # df_sub_bound <- subset(df_sub, abs(NEE_VUT_REF - mean(df_sub$NEE_VUT_REF)) < pct_NEE)
+  return(df_sub)
+}
+
+train_data_filter_raw <- function(df) {
+  df_sub <- subset(df, NEE_VUT_REF_QC == 0 & NIGHT == 1 & RECO_NT_VUT_REF > -9999)
+  # upper_NEE <- quantile(df_sub$NEE_VUT_REF - mean(df_sub$NEE_VUT_REF), 0.95)
+  # lower_NEE <- quantile(df_sub$NEE_VUT_REF - mean(df_sub$NEE_VUT_REF), 0.05)
+  # df_sub_bound <- subset(df_sub, (NEE_VUT_REF - mean(df_sub$NEE_VUT_REF) < upper_NEE))
+  # pct_NEE <- quantile(abs(df_sub$NEE_VUT_REF - mean(df_sub$NEE_VUT_REF)), 0.95)
+  # df_sub_bound <- subset(df_sub, abs(NEE_VUT_REF - mean(df_sub$NEE_VUT_REF)) < pct_NEE)
+  return(df_sub)
+}
+
+train_data_P_RECO_TS_aggregate <- function(df) {
+    ##Precipitation
+    df <- subset(df, P_F > -1)
+    df_P_daily <- aggregate(P_F ~ Time, data = df, sum)
+    df_P_DOY <- aggregate(P_F ~ DOY, data = df, sum)
+    colnames(df_P_daily) <- c("Time", "Daily_P")
+    df <- merge(df, df_P_daily, all = TRUE, by = "Time")
+    colnames(df_P_DOY) <- c("DOY", "DOY_P")
+    df <- merge(df, df_P_DOY, all = TRUE, by = "DOY")
+    ##NEE sum
+    df_RECO_daily <- aggregate(NEE_VUT_REF ~ Time, data = df, sum)
+    colnames(df_RECO_daily) <- c("Time", "Daily_NEE_sum")
+    df <- merge(df, df_RECO_daily, all = TRUE, by = "Time")
+    df_RECO_DOY <- aggregate(NEE_VUT_REF ~ DOY, data = df, sum)
+    colnames(df_RECO_DOY) <- c("DOY", "DOY_NEE_sum")
+    df <- merge(df, df_RECO_DOY, all = TRUE, by = "DOY")
+    ##Mean Daily temperature
+    df_TS_daily <- aggregate(TS_F_MDS_1 ~ Time, data = df, mean)
+    colnames(df_TS_daily) <- c("Time", "Daily_TS")
+    df <- merge(df, df_TS_daily, all = TRUE, by = "Time")
+    ##Mean Daily SWC
+    df_SWC_daily <- aggregate(SWC_F_MDS_1 ~ Time, data = df, mean)
+    colnames(df_SWC_daily) <- c("Time", "Daily_SWC")
+    df <- merge(df, df_SWC_daily, all = TRUE, by = "Time")
+    return(df)
+}
+
+##Set initial parameter/constant values
+Tref = 288.15
+T0 = 227.13
+CtoK = 273.15
+E0_max_Tsoil = 550
+E0_min = 30
+
+##Non-linear regression function for Initial Temperature sensitivity (window selection, temp limit, min point required)
+##E0 supposed to be constant, if ever change, will change over time due to plant adaptation strategies but not due to temperature change
+##Rules for choosing valid E0 (E0 < 0 -> = 0, E0 > 450 -> = 450)
+##Estimate short-term E0 with the value K estimated above
+#create an array of window
+temp_regression_ori <- function(df, win_len, overlap_len) {
+  E0_collection <- c()
+  E0_RSE <- c()
+  E0_date <- c()
+  date_list <- seq(as.Date(unique(df$Time)[1]),
+                 as.Date(unique(df$Time)[length(unique(df$Time))]), 
+                 by = (win_len - overlap_len))
+  for( i in as.list(date_list)) {
+      test_loop = subset(df, (as.Date(Time) >= i) & (as.Date(Time) <= i + days(win_len - 1)))
+      if(nrow(test_loop) >= 6) { #Only choose window with >= 6 points and temp range >= 5C
+        temp_range = max(test_loop$TS_F_MDS_1) - min(test_loop$TS_F_MDS_1)
+        if(temp_range >= 5) {
+          try({
+            regression_nls <- nls(NEE_VUT_REF ~ R0*exp(E0 * (1/(Tref - T0) - 1/(TS_F_MDS_1 + CtoK - T0))),
+                                  data = test_loop, control = nls.control(warnOnly = TRUE), start = list(R0 = 1, E0 = 100))
+            if(is.numeric(summary(regression_nls)$parameters["E0",2])) {
+              E0_RSE <- append(E0_RSE, summary(regression_nls)$parameters["E0",2])
+              E0_date <- append(E0_date, i + days(win_len - 1))
+              E0_collection <- append(E0_collection, coef(regression_nls)[2])
+            } else {print("produce NA of E0")}
+            })
+        } else {print("temp range < 5")} 
+      } else {print("window < 6 points")}
+  }
+  E0_collection <- as.data.frame(E0_collection)
+  E0_RSE <- as.data.frame(E0_RSE)
+  E0_date <- as.data.frame(E0_date)
+  E0_data_notFiltered <- data.frame(E0_collection, E0_RSE, E0_date)
+  return(E0_data_notFiltered)
+}
+
+temp_regression_ab <- function(df, win_len, overlap_len) {
+  E0_collection <- c()
+  E0_RSE <- c()
+  E0_date <- c()
+  date_list <- seq(as.Date(unique(df$Time)[1]),
+                 as.Date(unique(df$Time)[length(unique(df$Time))]), 
+                 by = win_len - overlap_len)
+  for( i in as.list(date_list)) {
+      test_loop = subset(df, as.Date(Time) >= i & as.Date(Time) <= i + days(win_len - 1))
+      if(nrow(test_loop) >= 6) { #Only choose window with >= 6 points and temp range >= 5C
+        temp_range = max(test_loop$TS_F_MDS_1) - min(test_loop$TS_F_MDS_1)
+        if(temp_range >= 5) {
+            try({
+              regression_nls <- nls(NEE_VUT_REF ~ exp(E0 * (1/(Tref - T0) - 1/(TS_F_MDS_1 + CtoK - T0)))*(a + b*Daily_EF),
+                                  data = test_loop, control = nls.control(warnOnly = TRUE), start = list(E0 = 200, a = 0, b = 1))
+            if(is.numeric(summary(regression_nls)$parameters["E0",2])) {
+              E0_RSE <- append(E0_RSE, summary(regression_nls)$parameters["E0",2])
+              E0_date <- append(E0_date, i + days(win_len - 1))
+              E0_collection <- append(E0_collection, coef(regression_nls)[1])
+            } else {print("produce NA of E0")}
+            })
+        } else {print("temp range < 5")} 
+      } else {print("window < 6 points")}
+  }
+  E0_collection <- as.data.frame(E0_collection)
+  E0_RSE <- as.data.frame(E0_RSE)
+  E0_date <- as.data.frame(E0_date)
+  E0_data_notFiltered <- data.frame(E0_collection, E0_RSE, E0_date)
+  return(E0_data_notFiltered)
+}
+temp_regression_ab_a_separate <- function(df, win_len, overlap_len) {
+  E0_collection <- c()
+  E0_RSE <- c()
+  E0_date <- c()
+  date_list <- seq(as.Date(unique(df$Time)[1]),
+                 as.Date(unique(df$Time)[length(unique(df$Time))]), 
+                 by = win_len - overlap_len)
+  for( i in as.list(date_list)) {
+      test_loop = subset(df, as.Date(Time) >= i & as.Date(Time) <= i + days(win_len - 1))
+      if(nrow(test_loop) >= 6) { #Only choose window with >= 6 points and temp range >= 5C
+        temp_range = max(test_loop$TS_F_MDS_1) - min(test_loop$TS_F_MDS_1)
+        if(temp_range >= 5) {
+          try({
+            regression_nls <- nls(NEE_VUT_REF ~ (exp(E0 * (1/(Tref - T0) - 1/(TS_F_MDS_1 + CtoK - T0)))*b*Daily_EF + a),
+                                  data = test_loop, control = nls.control(warnOnly = TRUE), start = list(E0 = 200, a = 1, b = 1))
+            if(is.numeric(summary(regression_nls)$parameters["E0",2])) {
+              E0_RSE <- append(E0_RSE, summary(regression_nls)$parameters["E0",2])
+              E0_date <- append(E0_date, i + days(win_len - 1))
+              E0_collection <- append(E0_collection, coef(regression_nls)[1])
+            } else {print("produce NA of E0")}
+            })
+        } else {print("temp range < 5")} 
+      } else {print("window < 6 points")}
+  }
+  E0_collection <- as.data.frame(E0_collection)
+  E0_RSE <- as.data.frame(E0_RSE)
+  E0_date <- as.data.frame(E0_date)
+  E0_data_notFiltered <- data.frame(E0_collection, E0_RSE, E0_date)
+  return(E0_data_notFiltered)
+}
+
+E0_short_calculation <- function(E0_data_notFiltered) {
+  E0_data_notFiltered$E0_collection[which(E0_data_notFiltered$E0_collection < 0)] <- 0
+  E0_data_notFiltered$E0_collection[which(E0_data_notFiltered$E0_collection > E0_max_Tsoil)] <- E0_max_Tsoil
+  ##Selection from the literature (Reichstein et al, 2005)
+  # E0_data <- subset(E0_data_notFiltered, E0_RSE < 0.5*E0_collection) #only E0 values having RSE less than 50% are chosen
+  # min1_index_E0 <- which(E0_data$E0_RSE == min(E0_data$E0_RSE))
+  # min2_index_E0 <- which(E0_data$E0_RSE == min(E0_data$E0_RSE[-min1_index_E0]))
+  # min3_index_E0 <- which(E0_data$E0_RSE == min(E0_data$E0_RSE[-c(min1_index_E0, min2_index_E0)]))
+  # E0_short_term <- mean(E0_data$E0_collection[c(min1_index_E0, min2_index_E0, min3_index_E0)])
+  # OneFlux E0 selection
+  #OneFLux Optimization 1st time
+  E0_data_notFiltered <- subset(E0_data_notFiltered , E0_collection > E0_min & E0_collection < E0_max_Tsoil & E0_RSE/E0_collection < 0.5)
+  E0_short_term <- mean(E0_data_notFiltered$E0_collection)
+  return(E0_short_term)
+}
+E0_data_QC <- function(E0_data_notFiltered) {
+  # E0_data_notFiltered$E0_collection[which(E0_data_notFiltered$E0_collection < 0)] <- 0
+  # E0_data_notFiltered$E0_collection[which(E0_data_notFiltered$E0_collection > 450)] <- 450
+  # E0_data <- subset(E0_data_notFiltered, E0_RSE < 0.5*E0_collection) #only E0 values having RSE less than 50% are chosen
+  #OneFlux Filter
+  E0_data_notFiltered$E0_collection[which(E0_data_notFiltered$E0_collection < 0)] <- 0
+  E0_data_notFiltered$E0_collection[which(E0_data_notFiltered$E0_collection > E0_max_Tsoil)] <- E0_max_Tsoil
+  E0_data<- subset(E0_data_notFiltered , E0_collection > E0_min & E0_collection < E0_max_Tsoil & E0_RSE/E0_collection < 0.5)
+  return(E0_data)
+}
+
+##Non-linear regression function for Water Availability
+#Regression for daily scale due to the assumption that water availability does not change significantly on diurnal pattern. R0 and E0 will take into account diurnal variability
+water_regression <- function(df, E0, win_len, overlap_len) {
+  a_collection <- c()
+  a_RSE <- c()
+  b_collection <- c()
+  b_RSE <- c()
+  ab_date <- c()
+  date_list <- seq(as.Date(unique(df$Time)[1]),
+                 as.Date(unique(df$Time)[length(unique(df$Time))]), 
+                 by = win_len - overlap_len)
+  for( i in as.list(date_list)) {
+      test_loop = subset(df, as.Date(Time) >= i & as.Date(Time) <= i + days(win_len - 1))
+      if(nrow(test_loop) >= 6) {
+          try({
+            regression_nls <- nls(NEE_VUT_REF ~ exp(E0 * (1/(Tref - T0) - 1/(TS_F_MDS_1 + CtoK - T0)))*(a + b*Daily_EF),
+                                  data = test_loop, control = nls.control(warnOnly = TRUE), start = list(a = 2, b = 10))
+            if(is.numeric(summary(regression_nls)$parameters["a",2]) & is.numeric(summary(regression_nls)$parameters["b",2])) {
+            a_RSE <- append(a_RSE, summary(regression_nls)$parameters["a",2])
+            a_collection <- append(a_collection, coef(regression_nls)[1])
+            b_RSE <- append(b_RSE, summary(regression_nls)$parameters["b",2])
+            b_collection <- append(b_collection, coef(regression_nls)[2])
+            ab_date <- append(ab_date, i + days(win_len - 1))
+            }
+          })
+      } else {print("less than 6 points available")}
+  }
+  a_collection <- as.data.frame(a_collection)
+  a_RSE <- as.data.frame(a_RSE)
+  b_collection <- as.data.frame(b_collection)
+  b_RSE <- as.data.frame(b_RSE)
+  ab_date <- as.data.frame(ab_date)
+  ab_data_notFiltered <- data.frame(a_collection, b_collection, a_RSE, b_RSE, ab_date)
+  return(ab_data_notFiltered)
+}
+
+water_regression_a_separate <- function(df, E0, win_len, overlap_len) {
+  a_collection <- c()
+  a_RSE <- c()
+  b_collection <- c()
+  b_RSE <- c()
+  ab_date <- c()
+  date_list <- seq(as.Date(unique(df$Time)[1]),
+                 as.Date(unique(df$Time)[length(unique(df$Time))]), 
+                 by = win_len - overlap_len)
+  for( i in as.list(date_list)) {
+      test_loop = subset(df, as.Date(Time) >= i & as.Date(Time) <= i + days(win_len - 1))
+      if(nrow(test_loop) >= 6) {
+          try({
+            regression_nls <- nls(NEE_VUT_REF ~ (exp(E0 * (1/(Tref - T0) - 1/(TS_F_MDS_1 + CtoK - T0)))*b*Daily_EF + a),
+                                  data = test_loop, control = nls.control(warnOnly = TRUE), start = list(a = 1, b = 1))
+            if(is.numeric(summary(regression_nls)$parameters["a",2]) & is.numeric(summary(regression_nls)$parameters["b",2])) {
+            a_RSE <- append(a_RSE, summary(regression_nls)$parameters["a",2])
+            a_collection <- append(a_collection, coef(regression_nls)[1])
+            b_RSE <- append(b_RSE, summary(regression_nls)$parameters["b",2])
+            b_collection <- append(b_collection, coef(regression_nls)[2])
+            ab_date <- append(ab_date, i + days(win_len - 1))
+            }
+          })
+      } else {print("less than 6 points available")}
+  }
+  a_collection <- as.data.frame(a_collection)
+  a_RSE <- as.data.frame(a_RSE)
+  b_collection <- as.data.frame(b_collection)
+  b_RSE <- as.data.frame(b_RSE)
+  ab_date <- as.data.frame(ab_date)
+  ab_data_notFiltered <- data.frame(a_collection, b_collection, a_RSE, b_RSE, ab_date)
+  return(ab_data_notFiltered)
+}
+b_filter <- function(df) {
+  df <- subset(df, b_collection >= 0 & b_RSE < 0.5*b_collection)
+  return(df)
+}
+b_mean <- function(df) {
+  df <- b_filter(df)
+  b_mean <- mean(df$b_collection)
+  return(b_mean)
+}
+
+##Non-linear regression using fixed E0 and b. estimating a changing for every 4 days
+centroid_day <- function(df, i) {
+  max_point = max(length(which(df$Time == as.Date(i))), length(which(df$Time == as.Date(i + 1))), length(which(df$Time == as.Date(i + 2))), length(which(df$Time == as.Date(i + 3))))
+  for(i in as.list(unique(df$Time))) {
+    if(length(which(df$Time == as.Date(i))) == max_point) {
+      df_sub <- subset(df, Time == as.Date(i))
+      return(df_sub$Time_full[1])
+    }
+  }
+}
+
+water_a_separate_regression <- function(df, E0, b, win_len, overlap_len) {
+  a_collection <- c()
+  a_RSE <- c()
+  a_date <- c()
+  date_list <- seq(as.Date(unique(df$Time)[1]),
+                 as.Date(unique(df$Time)[length(unique(df$Time))]), 
+                 by = win_len - overlap_len)
+  for( i in as.list(date_list)) {
+      test_loop = subset(df, as.Date(Time) >= i & as.Date(Time) <= i + days(win_len - 1))
+      if(nrow(test_loop) >= 6) {
+      time <- centroid_day(test_loop, i)
+      #time <- test_loop[nrow(test_loop), "Time_full"]
+          try({
+            regression_nls <- nls(NEE_VUT_REF ~ (exp(E0 * (1/(Tref - T0) - 1/(TS_F_MDS_1 + CtoK - T0)))*b*Daily_EF + a),
+                                  data = test_loop, control = nls.control(warnOnly = TRUE), start = list(a = 1))
+            if(is.numeric(summary(regression_nls)$parameters["a",2])) {
+            a_RSE <- append(a_RSE, summary(regression_nls)$parameters["a",2])
+            a_collection <- append(a_collection, coef(regression_nls)[1])
+            a_date <- append(a_date, time)
+            }
+          })
+      } else {print("less than 6 points available")}
+  }
+  a_collection <- as.data.frame(a_collection)
+  a_RSE <- as.data.frame(a_RSE)
+  a_date <- as.data.frame(a_date)
+  a_data_notFiltered <- data.frame(a_collection, a_RSE, a_date)
+  return(a_data_notFiltered)
+}
+
+water_a_regression <- function(df, E0, b, win_len, overlap_len) {
+  a_collection <- c()
+  a_RSE <- c()
+  a_date <- c()
+  date_list <- seq(as.Date(unique(df$Time)[1]),
+                 as.Date(unique(df$Time)[length(unique(df$Time))]), 
+                 by = win_len - overlap_len)
+  for( i in as.list(date_list)) {
+      test_loop = subset(df, as.Date(Time) >= i & as.Date(Time) <= i + days(win_len - 1))
+      if(nrow(test_loop) >= 6) {
+      time <- centroid_day(test_loop, i)
+      #time <- test_loop[nrow(test_loop), "Time_full"]
+          try({
+            regression_nls <- nls(NEE_VUT_REF ~ exp(E0 * (1/(Tref - T0) - 1/(TS_F_MDS_1 + CtoK - T0)))*(b*Daily_EF + a),
+                                  data = test_loop, control = nls.control(warnOnly = TRUE), start = list(a = 1))
+            if(is.numeric(summary(regression_nls)$parameters["a",2])) {
+            a_RSE <- append(a_RSE, summary(regression_nls)$parameters["a",2])
+            a_collection <- append(a_collection, coef(regression_nls)[1])
+            a_date <- append(a_date, time)
+            }
+          })
+      } else {print("less than 6 points available")}
+  }
+  a_collection <- as.data.frame(a_collection)
+  a_RSE <- as.data.frame(a_RSE)
+  a_date <- as.data.frame(a_date)
+  a_data_notFiltered <- data.frame(a_collection, a_RSE, a_date)
+  return(a_data_notFiltered)
+}
+
+a_interpolate_HH <- function(df, a_df) {
+  colnames(a_df) <- c("a_original", "a_RSE", "Time_full")
+  a_df$a_original[which(a_df$a_original < 10**-6)] <- 10**-6
+  a_merged <- merge(a_df, df, all = TRUE, by = "Time_full")
+  # Deleting initial and ending NA value of R0
+  index <- which(!is.na(a_merged$a_original))
+  a_merged_filter <- a_merged[index[1]:index[length(index)], ]
+  #Linear Interpolation for NA R0
+  a_interpolated <- data.frame(na.approx(a_merged_filter$a_original))
+  a_interpolated_df <- data.frame(a_interpolated, a_merged_filter)
+  colnames(a_interpolated_df)[1] <- "a_interpolated"
+  return(a_interpolated_df)
+}
+
+RECO_EF_estimation <- function(df, E0, b) {
+  df$RECO_NT_EF <- exp(E0 * (1/(Tref - T0) - 1/(df$TS_F_MDS_1 + CtoK - T0)))*(df$a_interpolated
+ + b*df$Daily_EF)
+  return(df)
+}
+RECO_EF_estimation_a_separate <- function(df, E0, b) {
+  df$RECO_NT_a_out <- exp(E0 * (1/(Tref - T0) - 1/(df$TS_F_MDS_1 + CtoK - T0)))*b*df$Daily_EF + df$a_interpolated
+  return(df)
+}
+RECO_ori_estimation <- function(df, E0) {
+  df$RECO_NT_ori <- exp(E0 * (1/(Tref - T0) - 1/(df$TS_F_MDS_1 + CtoK - T0)))*(df$a_interpolated)
+  return(df)
+}
+
+lmp <- function (modelobject) {
+	if (class(modelobject) != "lm") stop("Not an object of class 'lm' ")
+	f <- summary(modelobject)$fstatistic
+	p <- pf(f[1],f[2],f[3],lower.tail=F)
+	attributes(p) <- NULL
+	return(p)
+}
+
+##Create daily aggregated dataset for all files
+daily_aggregated_df <- function(df) {
+  ustar_train_temp <- df
+  Daily_NEE <- aggregate(NEE_VUT_REF ~ Time, data = ustar_train_temp, mean)$NEE_VUT_REF
+  Daily_TA <- aggregate(TA_F ~ Time, data = ustar_train_temp, mean)$TA_F
+  Daily_RECO_temp <- aggregate(RECO_NT_ori ~ Time, data = ustar_train_temp, mean)$RECO_NT_ori
+  Daily_RECO_flux <- aggregate(RECO_NT_VUT_REF ~ Time, data = ustar_train_temp, mean)$RECO_NT_VUT_REF
+  Daily_resi_temp <- Daily_NEE - Daily_RECO_temp
+  Daily_EF <- aggregate(Daily_EF ~ Time, data = ustar_train_temp, mean)$Daily_EF
+  Month <- aggregate(Month ~ Time, data = ustar_train_temp, mean)$Month
+  Time <- unique(ustar_train_temp$Time)
+  nonscaling_clustering_df <- data.frame(Daily_NEE, Daily_RECO_temp, Daily_RECO_flux, Daily_resi_temp, Daily_EF, Time, Month, Daily_TA)
+  return(nonscaling_clustering_df)
+}
+
+My_Theme = theme(
+  axis.title.x = element_text(size = 16),
+  axis.text.x = element_text(size = 14),
+  axis.title.y = element_text(size = 16))
+
+##pulse_correction will return data frame with corrected Reco and cluster decision. Cluster results are run 100 times and chosen based on three criteria: all positive resi values, more than 2 points in the clusters, and has the highest rsq among the qualified ones.
+pulse_correction <- function(df, iteration) {
+  ##set up array containing cluster results
+  rsq <- c()
+  cluster_number_list <- c()
+  df_list <- list()
+  fail_cluster_negative <- 0
+  fail_cluster_not_enough_point <- 0
+  fail_cluster_not_max <- 0
+  for(j in 1:iteration) {
+    tryCatch(
+    cluster_run <- specc(as.matrix(df[, c("Daily_resi_temp", "Daily_EF")]), 3),
+    error=function(e) e
+    )
+    clustered_defined_df <- df %>% add_column(cluster = factor(cluster_run))
+    #Select cluster in which 80% points are positive values only
+    cluster_number <- NA
+    cluster_number_positive <- NA
+    for(i in 1:3) {
+    df_positive <- subset(clustered_defined_df, cluster == i & Daily_resi_temp > 0)
+    df_cluster <- subset(clustered_defined_df, cluster == i)
+    #choose the cluster that also contains the highest points
+    max_resi <- max(clustered_defined_df$Daily_resi_temp)
+    cluster_max <- clustered_defined_df$cluster[which(clustered_defined_df$Daily_resi_temp == max_resi)]
+    if(nrow(df_positive) > 0.6*nrow(df_cluster)) {
+      cluster_number_positive = i
+      if(cluster_number_positive == cluster_max) {
+        cluster_number = cluster_number_positive
+      } else {
+      fail_cluster_not_max = fail_cluster_not_max + 1
+      print("Cluster chosen does not have the max value")
+    }
+    } else {
+      fail_cluster_negative = fail_cluster_negative + 1
+      print("Cluster algorithm mistakenly identifies negative values")
+    }
+    }
+    #Check if the cluster has more than 2 points
+    cluster_chosen_df <- subset(clustered_defined_df, cluster == cluster_number)
+    if(nrow(cluster_chosen_df) > 2) {
+    #Derive linear function for the selected cluster
+    cluster_chosen_df_lm <- lm(Daily_resi_temp ~ Daily_EF, data = cluster_chosen_df)
+    #Calculating RECO based on cluster regression 
+    index_cluster <- which(clustered_defined_df$cluster == cluster_number)
+    clustered_defined_df$predicted_RECO <- NULL
+    for(k in 1:nrow(clustered_defined_df)) {
+      if(k %in% index_cluster) {
+        clustered_defined_df$predicted_RECO[k] <- clustered_defined_df$Daily_RECO_temp[k] + cluster_chosen_df_lm$coefficients[1] +
+                                                  cluster_chosen_df_lm$coefficients[2]*clustered_defined_df$Daily_EF[k]
+      } else {
+        clustered_defined_df$predicted_RECO[k] <- clustered_defined_df$Daily_RECO_temp[k]
+      }
+    }
+    #Calculating rsq for each cluster run
+    rsq_j <- rsq(clustered_defined_df, Daily_NEE, predicted_RECO)[,3]
+    rsq[j] <- rsq_j
+    cluster_number_list[j] <- cluster_number
+    df_list[[j]] <- clustered_defined_df
+    } else {
+      fail_cluster_not_enough_point = fail_cluster_not_enough_point + 1
+      print("not enough points in the cluster")}
+  }
+  #Choose the cluster with the highest rsq. Returning in the following order: 
+  #[1] data frame with cluster information. 
+  #[2] highest rsq from all cluster
+  #[3] the index of the cluster that been categorized as pulse 
+  #[4] intercept for the lm function fitted through the pulse cluster
+  #[5] slope for the lm function fitted through the pulse cluster
+  #[6] squared of the fitted lm
+  #[7] p-value of the fitted lm
+    rsq_unlist <- array(as.numeric(unlist(rsq)))
+    cluster_number_unlist <- array(as.numeric(unlist(cluster_number_list)))
+    max_sort <- sort(rsq_unlist, index.return = TRUE, decreasing = TRUE)
+    max_index <- max_sort$ix[1]
+    cluster_df_final <- data.frame(df_list[max_index])
+    return(list(cluster_df_final, max_sort$x[1], cluster_number_unlist[max_index], cluster_chosen_df_lm$coefficients[1], cluster_chosen_df_lm$coefficients[2], summary(cluster_chosen_df_lm)$r.squared,  lmp(cluster_chosen_df_lm)))
+  }
+
+##create a function to run cluster on customized window
+cluster_fix_interval <- function(df, iteration, ini_step, end_step) {
+  df_new <- df[ini_step:end_step,]
+  ##delete lower percentage of NEE to avoid outliers
+  df_cluster <- pulse_correction(df_new, iteration)
+  return(df_cluster)
+}
+
+cluster_adj <- function(df, iteration, ini_step, old_increment, new_increment) {
+  end_step = ini_step + old_increment
+  cluster_test <- try(cluster_fix_interval(df, iteration, ini_step, end_step))
+  if(inherits(cluster_test, "try-error") | nrow(cluster_test[[1]]) == 0) {
+      end_step <- end_step + new_increment
+      cluster_test <- try(cluster_fix_interval(df, iteration, ini_step, end_step))
+  }
+  return(list(cluster_test, end_step))
+}
+
+#write a function to extract data for precipitation and radiation 
+P_aggregate <- function(df) {
+  df <- subset(df, P_F_QC < 2)
+  df_P <- aggregate(P_F ~ Time, data = df, mean)
+  colnames(df_P) <- c("Time", "Mean_HH_P")
+  return(df_P)
+}
+
+daytime_SW_aggregate <- function(df) {
+  df <- subset(df, SW_IN_F_QC < 2 & NIGHT == 0)
+  df_SW <- aggregate(SW_IN_F ~ Time, data = df, mean)
+  colnames(df_SW) <- c("Time", "Mean_DT_SW")
+  return(df_SW)
+}
+
+mid_NEE_aggregate <- function(df) {
+  df <- subset(df, NEE_VUT_REF > -9999 & NIGHT == 0)
+  df_NEE <- aggregate(NEE_VUT_REF ~ Time, data = df, mean)
+  colnames(df_NEE) <- c("Time", "Mean_DT_NEE")
+  return(df_NEE)
+}
+```
+
+
+```{r}
+#Access HH file inside zip file
+set.seed(123)
+folder_dir_zip <- "/Volumes/GoogleDrive/My Drive/Ngoc/Ngoc 2/EF-Temp-Regression/Data/GRA:SH:SAV/test/"
+#folder_dir_zip <- "/Volumes/GoogleDrive/My Drive/Ngoc/Ngoc 2/EF-Temp-Regression/Data/GRA:SH:SAV/zip_file/"
+list_file_zip <- list.files(folder_dir_zip)
+for(i in 1:length(list_file_zip)) {
+  unzipped_file <- unzip(paste(folder_dir_zip, list_file_zip[i], sep = ""))
+  site_data <- read.csv(unzipped_file[8], header = TRUE)
+  #site_name extraction
+  site_name <- substr(list_file_zip[i], start = 5, stop = 10)
+  site_data_tc <- time_convert(site_data)
+  site_data_tc_ef <- add_dailyEF(site_data_tc)
+  site_train_temp <- train_data_filter(site_data_tc_ef)
+  ##Run temp-regression for adjusted NEE
+  E0_ori_df <- temp_regression_ori(site_train_temp, 14, 5)
+  E0_ori <- E0_short_calculation(E0_ori_df)
+  a_ori_df <- water_a_regression(site_train_temp, E0_ori, 0, 4, 1)
+  a_ori_interpolated <- a_interpolate_HH(site_data_tc_ef, a_ori_df)
+  RECO_ori_df <- RECO_ori_estimation(a_ori_interpolated, E0_ori)
+  ##Write and name the temp-regression file
+  save_dir <- paste("/Volumes/GoogleDrive/My Drive/Ngoc/EF-Temp-Regression/Results/Dry_site_Spec_Clustering/temp_regression/", site_name, "_temp_regression_HH.csv", sep = "")
+  write.csv(RECO_ori_df, save_dir)
+  RECO_site_train_temp <- train_data_filter(RECO_ori_df)
+  daily_train_temp <- daily_aggregated_df(RECO_site_train_temp)
+  max_window <- as.integer(nrow(daily_train_temp)/90) + 1
+  ini_step_record <- c()
+  ini_step = 1
+  ini_step_record[1] <- ini_step
+  daily_train_temp$Year <- as.numeric(format(as.Date(daily_train_temp$Time), "%Y"))
+  daily_train_temp_test <- subset(daily_train_temp, Daily_NEE > 0) 
+  ##Add SW, P, and NEE to all_pulse_df
+  mid_NEE_df <- mid_NEE_aggregate(RECO_ori_df)
+  SW_df <- daytime_SW_aggregate(RECO_ori_df)
+  P_df <- P_aggregate(RECO_ori_df)
+  merge1 <- merge(SW_df, mid_NEE_df, by = "Time", all = TRUE)
+  merge2 <- merge(merge1, P_df, by = "Time", all = TRUE)
+  daily_train_temp_test <- merge(merge2, daily_train_temp_test, by = "Time", all = FALSE)
+  pulse_df <- list()
+  # all_year <- list()
+  # p_value <- c()
+  # rsq_year_list <- c()
+  rsq_temp_list <- c()
+  rsq_cluster_list <- c()
+  rsq_lm_list <- c()
+  lm_slope_list <- c()
+  lm_intercept_list <- c()
+  p_lm_list <- c()
+  pdf(paste("/Volumes/GoogleDrive/My Drive/Ngoc/EF-Temp-Regression/Results/Dry_site_Spec_Clustering/moving_window/", site_name, "_moving_window_withP.pdf"), height = 7, width = 21)
+  for(i in 1:max_window) {
+    tryCatch({
+    pulse_correction_df <- cluster_adj(daily_train_temp_test, 300, ini_step_record[i], 90, 14)
+    #set the ini_step for another loop
+    ini_step_record[i+1] = as.numeric(pulse_correction_df[[2]]) + 1
+    cluster_num <- pulse_correction_df[[1]][[3]]
+    #extract the upper part of df
+    upper_df <- subset(pulse_correction_df[[1]][[1]], cluster == cluster_num)
+    pulse_df[[i]] <- upper_df
+    all_cluster <- ggplot(pulse_correction_df[[1]][[1]], aes(Daily_EF, Daily_resi_temp, color = cluster)) + geom_point() + theme_bw() +
+                     scale_color_manual(values = c("1" = "#a8327d", "2" = "#327da8", "3" = "#32a87b")) +
+                     geom_smooth(method="lm", formula = y ~ x, se = FALSE) + My_Theme
+    predicted_plot <- ggplot(pulse_correction_df[[1]][[1]], aes(x = Time)) + geom_line(aes(y = Daily_NEE), size = 0.2) +
+                     geom_line(aes( y = Daily_RECO_temp), color = "blue") +
+                     geom_point(aes( y = predicted_RECO, color = cluster), size = 0.8) +
+                     scale_color_manual(values = c("1" = "#a8327d", "2" = "#327da8", "3" = "#32a87b")) +
+                     theme_bw() + theme(legend.position="top") + scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) + My_Theme
+    ts_EF <- ggplot(pulse_correction_df[[1]][[1]], aes(x = Time)) + geom_line(aes(y = Daily_EF), color = "pink") + theme_bw() + My_Theme
+    rsq_temp <- rsq(pulse_correction_df[[1]][[1]], Daily_NEE, Daily_RECO_temp)
+    rsq_cluster <- rsq(pulse_correction_df[[1]][[1]], Daily_NEE, predicted_RECO)
+    graph_cluster <- all_cluster + labs(title = paste("rsq_cluster: ", rsq_cluster[,3]), subtitle = paste("rsq_temp: ", rsq_temp[,3])) + My_Theme
+    grid.arrange(arrangeGrob(predicted_plot, ts_EF, nrow = 2), graph_cluster, nrow = 1, widths = c(6, 3))
+    ##store information in array
+    rsq_temp_list <- append(rsq_temp_list, rsq_temp[,3])
+    rsq_cluster_list <- append(rsq_cluster_list, rsq_cluster[,3])
+    rsq_lm_list <- append(rsq_lm_list, pulse_correction_df[[6]])
+    lm_slope_list <- append(lm_slope_list, pulse_correction_df[[5]])
+    lm_intercept_list <- append(lm_intercept_list, pulse_correction_df[[4]])
+    p_lm_list <- append(p_lm_list, pulse_correction_df[[7]])
+    }, error=function(e){})
+    }
+  dev.off()
+  #Only choose the combination of pulse_df that passes the p-value test within 6 months??
+  ##Combine the pulse datasets
+  all_pulse_df <- NULL
+  for(i in 1:length(pulse_df)) {
+    all_pulse_df <- rbind(all_pulse_df, pulse_df[[i]])
+  }
+  all_pulse_df$Year <- as.numeric(format(as.Date(all_pulse_df$Time,  format="%Y-%m-%d"),"%Y"))
+  #Adding Year column to daily_train_temp_test
+  daily_train_temp_test$Year <- as.numeric(format(as.Date(daily_train_temp_test$Time,  format="%Y-%m-%d"),"%Y"))
+  sign_year <- c()
+  pdf(paste("/Volumes/GoogleDrive/My Drive/Ngoc/EF-Temp-Regression/Results/Dry_site_Spec_Clustering/yearly_summary/", site_name, "_moving_window_yearly_summary_withP.pdf"), height = 7, width = 21)
+  for(i in unique(all_pulse_df$Year)) {
+    all_pulse_df_sub <- subset(all_pulse_df, Year == i)
+    daily_train_temp_sub <- subset(daily_train_temp_test, Year == i)
+    df <- merge(all_pulse_df_sub, daily_train_temp_sub, by = "Time", all = TRUE)
+    #improvement in R per year
+    pulse_sub <- subset(df, !is.na(predicted_RECO))
+    rsq_new <- rsq(pulse_sub, Daily_NEE.x, predicted_RECO)[,3]
+    rsq_old <- rsq(pulse_sub, Daily_NEE.x, Daily_RECO_temp.x)[,3]
+    rsq_lab <- paste("For pulse points: temp_rsq: ", round(rsq_old, 3), "      cluster_rsq: ", round(rsq_new, 3))
+    #plot time series by year to visually inspect the improvement
+    predicted_plot <- ggplot(df, aes(x = as.Date(Time))) + geom_line(aes(y = Daily_NEE.y), size = 0.2) + geom_line(aes(y = Daily_RECO_temp.y), color = "blue") + geom_point(aes( y = predicted_RECO), size = 0.5) + theme_bw() + theme(legend.position="top") + scale_y_continuous(labels = scales::number_format(accuracy = 0.1)) + My_Theme
+    ts_EF <- ggplot(df, aes(x = as.Date(Time))) + geom_line(aes(y = Daily_EF.y), color = "pink") + geom_bar(aes(y = Mean_HH_P.y), color = "red", stat = "identity") + theme_bw() + My_Theme 
+    predicted_plot
+    ts_EF
+    #plot lm scatter plot
+    fit_lm <- lm(Daily_resi_temp ~ Daily_EF, all_pulse_df_sub)
+    year_lm <- ggplot(all_pulse_df_sub, aes(x = Daily_EF, y = Daily_resi_temp)) + geom_point() + theme_bw() + geom_smooth(method="lm", formula = y ~ x, se = FALSE) + labs(title = rsq_lab, subtitle = paste("Year ", i, "    p-value: ", lmp(fit_lm), "      slope: ", round(fit_lm$coefficients[2], 3), "     intercept: ", round(fit_lm$coefficients[1], 3)))
+    grid.arrange(arrangeGrob(predicted_plot, ts_EF, nrow = 2), year_lm, nrow = 1, widths = c(6, 3))
+    if(lmp(fit_lm) < 0.05) {
+      sign_year <- append(sign_year, i)
+    }
+  }
+  dev.off()
+  #write the csv file with updated RECO values
+  csv_file <- merge(all_pulse_df, daily_train_temp, by = "Time", all = TRUE)
+  csv_file_rename <- csv_file[, c("Time", "Month.y", "Year.y", "predicted_RECO", "Daily_NEE.y", "Daily_RECO_temp.y", "Daily_RECO_flux.y", "Daily_resi_temp.y", "Daily_EF.y", "Daily_TA.y")]
+  colnames(csv_file_rename) <- c("Time", "Month", "Year", "predicted_RECO", "Daily_NEE", "Daily_RECO_temp", "Daily_RECO_flux", "Daily_resi_temp", "Daily_EF", "Daily_TA")
+  write.csv(csv_file_rename, paste("/Volumes/GoogleDrive/My Drive/Ngoc/EF-Temp-Regression/Results/Dry_site_Spec_Clustering/csv_updated_RECO/", site_name, "_updated_RECO_withP.csv"))
+}
+
+
+```
+
+
+
+```{r}
+##Calculating net Carbon understimated
+library(bigleaf)
+# umolCO2.to.gC(CO2_flux, constants = bigleaf.constants())
+# function (CO2_flux, constants = bigleaf.constants()) 
+# {
+#     C_flux <- CO2_flux * constants$umol2mol * constants$Cmol * 
+#         constants$kg2g * constants$days2seconds
+#     return(C_flux)
+# }
+
+HH_df <- read.csv("/Volumes/GoogleDrive/My Drive/Ngoc/EF-Temp-Regression/Results/Dry_site_Spec_Clustering/temp_regression/US-SRG_temp_regression_HH.csv")
+corrected_df <- read.csv("/Volumes/GoogleDrive/My Drive/Ngoc/EF-Temp-Regression/Results/Dry_site_Spec_Clustering/csv_updated_RECO/ US-SRG _updated_RECO_withP.csv")
+corrected_df <- subset(corrected_df, !is.na(predicted_RECO))
+HH_df <- train_data_filter(HH_df)
+total_C_dif <- 0
+num_point_list <- c()
+for(i in 1:nrow(corrected_df)) {
+  num_point = length(which(HH_df$Time == corrected_df$Time[i]))
+  num_point_list[i] <- num_point 
+  C_increment = (corrected_df$predicted_RECO[i] - corrected_df$Daily_RECO_flux[i])*48*10^-6*12*60*30
+  total_C_dif = total_C_dif + C_increment
+}
+total_C_dif # gC/m2/allyear
+
+
+# 200 over all points different gC/m2 (per year is 30? bc there are 7 years?)
+# 40 over nighttime observational only
+yy_df <- read.csv("/Volumes/GoogleDrive/My Drive/Ngoc/Ngoc 2/EF-Temp-Regression/Data/GRA:SH:SAV/FLX_US-SRG_FLUXNET2015_FULLSET_2008-2014_1-4/FLX_US-SRG_FLUXNET2015_FULLSET_YY_2008-2014_1-4.csv")
+sum(yy_df$RECO_NT_VUT_REF)
+```
+
+```{r}
+#interpolating to Daytime and estimate C for Yanghui
+#update with Mirco about the shortwave radiation and precipitation filter. 
+#What's about false precipitation event created by dew? 
+#filter for BEP with no correlation with increase in EF
+#only take into account for event with  precipitation > 2 mm?
+
+
+```
+
+
+```{r}
+##Decomposing rain pulse time series
+#Test on IT-Neu site
+df <- read.csv("/Volumes/GoogleDrive/My Drive/Ngoc/rain_pulse_decomposition/Data/FLX_IT-Noe_FLUXNET2015_FULLSET_HH_2004-2014_2-4.csv")
+df <- time_convert(df)
+df_train <- train_data_filter_raw(df)
+df_train_2009 <- subset(df_train, Year == 2009 & Month == 2)
+df_train_2009$HH_x <- df_train_2009$Hour + df_train_2009$DOY
+ggplot(df_train_2009, aes(x = HH_x)) + geom_line(aes(y = NEE_VUT_REF), color = "pink") + geom_point(aes(y = NEE_VUT_REF), color = "pink") + geom_bar(aes(y = P_F*50), color = "red", stat = "identity") + theme_bw() + My_Theme 
+
+
+```
+
+
+```{r}
+##Test US-SRG for An
+df <- read.csv("/Users/ngocnguyen/Downloads/FLX_US-SRG_FLUXNET2015_FULLSET_HH_2008-2017_beta-5.csv")
+df <- time_convert(df)
+df <- add_dailyEF(df)
+df_QC_sub <- subset(df, NIGHT == 1 & Year == 2009 & NEE_VUT_REF_QC == 0 & TS_F_MDS_1_QC == 0 & SWC_F_MDS_1_QC == 0 & !is.na(Daily_EF))
+df_night <- subset(df, NIGHT == 1 & NEE_VUT_REF_QC == 0 & TS_F_MDS_1_QC == 0 & SWC_F_MDS_1_QC == 0 & !is.na(Daily_EF))
+P1 <- ggplot(df_QC_sub, aes(x = Time)) + geom_line(aes(y = SWC_F_MDS_1)) + theme_bw() + 
+  geom_bar(aes(y = P_ERA*5), stat="identity", color = "red") +
+  geom_line(aes(y = Daily_EF*10), color = "blue")
+P2 <- ggplot(df_QC_sub, aes(x = Time)) + geom_point(aes(y = NEE_VUT_REF), size = 0.1) + geom_line(aes(y = RECO_NT_VUT_REF), color = "red") + theme_bw()
+grid.arrange(P1, P2, nrow = 2)
+rsq(df_QC_sub, NEE_VUT_REF, RECO_NT_VUT_REF)
+df_QC_sub$resi <- df_QC_sub$NEE_VUT_REF - df_QC_sub$RECO_NT_VUT_REF
+#random error
+hist(df_QC_sub$NEE_VUT_REF_RANDUNC)
+##Run spectral clustering on EF, SWC, P_ERA, NEE
+df_QC_sub_month <- subset(df_QC_sub, Month < 4)
+df_QC_sub_month$SWC <- df_QC_sub_month$SWC_F_MDS_1/10
+cluster_run <- specc(as.matrix(df_QC_sub_month[, c("resi", "Daily_EF", "NEE_VUT_REF_RANDUNC")]), 3)
+
+clustered_defined_df <- df_QC_sub_month %>% add_column(cluster = factor(cluster_run))
+ggplot(clustered_defined_df, aes(x = Time)) + geom_point(aes(y = NEE_VUT_REF, color = cluster)) + theme_bw()
+ggplot(clustered_defined_df, aes(x = Time)) + geom_point(aes(y = resi, color = cluster)) + geom_line(aes(y = NEE_VUT_REF_RANDUNC)) + theme_bw() + geom_line(aes(y = Daily_EF*3), color = "red")
+```
+
+```{r}
+#3installing derivative function
+install.packages("pspline")
+library(pspline)
+```
+
+##Extracting observational dataset
+```{r}
+QC_filter <- function(df) {
+  if("NEE_VUT_REF_QC" %in% colnames(df)) {
+    df <- subset(df, NEE_VUT_REF_QC == 0)
+    df$Net_Ecosystem_Exchange <- df$NEE_VUT_REF
+    df$Precipitation <- df$P_ERA
+  }
+  if("TS_F_MDS_1_QC" %in% colnames(df)) {
+    df <- subset(df, TS_F_MDS_1_QC == 0)
+    df$Soil_Temperature <- df$TS_F_MDS_1
+  }
+  if("TA_F_QC" %in% colnames(df)) {
+    df <- subset(df, TA_F_QC == 0)
+    df$Air_Temperature <- df$TA_F
+  }
+  if("SWC_F_MDS_1_QC" %in% colnames(df)) {
+    df <- subset(df, SWC_F_MDS_1_QC == 0)
+    df$Soil_Water_Content <- df$SWC_F_MDS_1
+  }
+  return(df)
+}
+
+folder_dir_zip <- "/Volumes/GoogleDrive/My Drive/ML for Climate Modelling/Dry sites/"
+#folder_dir_zip <- "/Volumes/GoogleDrive/My Drive/Ngoc/Ngoc 2/EF-Temp-Regression/Data/GRA:SH:SAV/zip_file/"
+list_file_zip <- list.files(folder_dir_zip)
+for(i in 1:length(list_file_zip)) {
+  unzipped_file <- unzip(paste(folder_dir_zip, list_file_zip[i], sep = ""))
+  site_data <- read.csv(unzipped_file[8], header = TRUE)
+  #site_name extraction
+  site_name <- substr(list_file_zip[i], start = 5, stop = 10)
+  site_data_tc <- time_convert(site_data)
+  site_data_tc_ef <- add_dailyEF(site_data_tc)
+  site_train_qc <- QC_filter(site_data_tc_ef)
+  train_data <- subset(site_train_qc, NIGHT == 1 & !is.na(Daily_EF))
+  train_data_short <- data.frame(train_data$Time, train_data$Year, train_data$Month, train_data$DOY, train_data$Hour, train_data$Net_Ecosystem_Exchange, train_data$Soil_Temperature, train_data$Daily_EF, train_data$Air_Temperature, train_data$Precipitation, train_data$Soil_Water_Content, train_data$NETRAD)
+  colnames(train_data_short) <- c("Time", "Year", "Month", "DOY", "Hour", "Net_Ecosystem_Exchange", "Soil_Temperature", "Daily_EF", "Air_Temperature", "Precipitation", "Soil_Water_Content")
+  write.csv(train_data_short, paste("/Volumes/GoogleDrive/My Drive/ML for Climate Modelling/Observational_RECO/", site_name, "_observation.csv", sep =""))
+}
+
+```
+
+```{r}
+##Extracting data for US-SRG as in the Partitioning paper
+  site_data <- read.csv("/Volumes/GoogleDrive/My Drive/Ngoc/Ngoc 2/EF-Temp-Regression/Data/ONEFluxBeta/FLX_US-SRG_FLUXNET2015_FULLSET_HH_2008-2017_beta-5.csv", header = TRUE)
+  #site_name extraction
+  site_name <- "US_SRG"
+  site_data_tc <- time_convert(site_data)
+  df_shortcut <- subset(site_data_tc, TA_F_QC == 0 & TS_F_MDS_1_QC == 0 & SWC_F_MDS_1_QC == 0 & WS_F_QC == 0 & SW_IN_F_QC == 0 &
+                          VPD_F_QC == 0 & NEE_VUT_REF_QC == 0)
+  #Calculating SW_IN_POT derivative
+  df_shortcut$SW_IN_POT_Derivative <- df_shortcut$SW_IN_POT
+  df_shortcut$SW_IN_POT_Derivative[1] = 0
+  for(i in 2:nrow(df_shortcut)) {
+  df_shortcut$SW_IN_POT_Derivative[i] <- df_shortcut$SW_IN_POT[i] - df_shortcut$SW_IN_POT[i-1]
+  }
+  #cos, sin of WD
+  df_shortcut$WD_cos <- cos(df_shortcut$WD)
+  df_shortcut$WD_sin <- sin(df_shortcut$WD)
+  #cos, sin of WD
+  df_shortcut$DOY_cos <- cos(df_shortcut$DOY)
+  df_shortcut$DOY_sin <- sin(df_shortcut$DOY)
+  #Daily average of SW_IN_POT
+  Daily_average_SW_IN_POT <- aggregate(SW_IN_POT ~ Time, data = df_shortcut, mean)
+  colnames(Daily_average_SW_IN_POT) <- c("Time", "Daily_average_SW_IN_POT")
+  df_shortcut <- merge(df_shortcut, Daily_average_SW_IN_POT, all = TRUE, by = "Time")
+  #Daily average of SW_IN_POT derivative
+  Daily_average_SW_IN_POT_Deriv <- aggregate(SW_IN_POT_Derivative ~ Time, data = df_shortcut, mean)
+  colnames(Daily_average_SW_IN_POT_Deriv) <- c("Time", "Daily_average_SW_IN_POT_Deriv")
+  df_shortcut <- merge(df_shortcut, Daily_average_SW_IN_POT_Deriv, all = TRUE, by = "Time")
+  #Daily average of NEE_VUT_REF at night
+  df_shortcut_night <- subset(site_data_tc, NIGHT == 1 & NEE_VUT_REF_QC < 2)
+  Night_average_NEE <- aggregate(NEE_VUT_REF ~ Time, data = df_shortcut_night, mean)
+  colnames(Night_average_NEE) <- c("Time", "Night_average_NEE")
+  df_shortcut <- merge(df_shortcut, Night_average_NEE, all = TRUE, by = "Time")
+  #Daily average of NEE_VUT_REF at day
+  df_shortcut_day <- subset(site_data_tc, NIGHT == 0 & NEE_VUT_REF_QC < 2)
+  Day_average_NEE <- aggregate(NEE_VUT_REF ~ Time, data = df_shortcut_day, mean)
+  colnames(Day_average_NEE) <- c("Time", "Day_average_NEE")
+  df_shortcut <- merge(df_shortcut, Day_average_NEE, all = TRUE, by = "Time")
+  #Calculate GPP prox
+  for( i in nrow(df_shortcut)) {
+    fraction_of_DT <- length(which(site_data_tc$NIGHT == 0))/nrow(site_data_tc)
+  }
+  df_shortcut$fraction_of_DT = fraction_of_DT
+  df_shortcut$df_shortcut_GPP_prox <- (df_shortcut$Day_average_NEE - df_shortcut$Night_average_NEE)*df_shortcut$fraction_of_DT
+  df_final <- data.frame(df_shortcut$Time, df_shortcut$Time_full, df_shortcut$DOY, df_shortcut$Month, df_shortcut$Year, df_shortcut$Hour, df_shortcut$df_shortcut_GPP_prox, df_shortcut$Night_average_NEE, df_shortcut$Day_average_NEE, df_shortcut$Daily_average_SW_IN_POT_Deriv, df_shortcut$Daily_average_SW_IN_POT, df_shortcut$DOY_cos, df_shortcut$DOY_sin, df_shortcut$WD_cos, df_shortcut$WD_sin, df_shortcut$SW_IN_POT_Derivative, df_shortcut$TA_F, df_shortcut$TS_F_MDS_1,
+             df_shortcut$SWC_F_MDS_1, df_shortcut$WS_F, df_shortcut$SW_IN_F, df_shortcut$VPD_F, df_shortcut$NEE_VUT_REF)
+  colnames(df_final) <- c("Time", "Time_full", "DOY", "Month", "Year", "Hour", "df_shortcut_GPP_prox", "Night_average_NEE", "Day_average_NEE", "Daily_average_SW_IN_POT_Deriv", "Daily_average_SW_IN_POT", "DOY_cos", "DOY_sin", "WD_cos", "WD_sin", "SW_IN_POT_Derivative", "TA_F", "TS_F_MDS_1", "SWC_F_MDS_1", "WS_F", "SW_IN_F", "VPD_F", "NEE_VUT_REF")
+  df_last <- na.omit(df_final)
+  write.csv(df_last, paste("/Volumes/GoogleDrive/My Drive/ML for Climate Modelling/", site_name, "_observation_paper_simulated.csv", sep =""))
+  df_last
+ unique(df_last$Year)
+subset(df_last, Year == 2017)
+```
+
+
+
+
+
+
+
+
+
