@@ -9,6 +9,6 @@ Datasets used in this study are publicly available via https://fluxnet.org/
 Email Ngoc B. Nguyen (ngoc.nguyen@berkeley.edu) if you have any questions or collaboration ideas.
 
 # Publication
-N Nguyen, TF Keenan, M Migliavacca, JK Green, M Bassiouni (2022). Using Water Availability to Develop Respiration Models for Eddy-covariance Observations. AGU Annual Meeting 2022.
+N Nguyen, TF Keenan, M Migliavacca, JK Green, M Bassiouni (2022). Using Water Availability to Develop Respiration Models for Eddy-covariance Observations. AGU Annual Meeting 2022. https://ui.adsabs.harvard.edu/abs/2022AGUFM.B52H0930N/abstract
 
 
